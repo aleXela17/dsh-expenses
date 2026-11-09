@@ -1,0 +1,3 @@
+- insert:
+    - id: expenses
+      name: '@local/dsh-expenses'

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Expenses">
+  <rect width="64" height="64" rx="14" fill="#2f6fed"/>
+  <path d="M21 14h22v36l-5.5-3.6L32 50l-5.5-3.6L21 50z" fill="#ffffff" opacity="0.96"/>
+  <path d="M27 24h10M27 30h10M27 36h6" stroke="#2f6fed" stroke-width="2.6" stroke-linecap="round"/>
+</svg>
