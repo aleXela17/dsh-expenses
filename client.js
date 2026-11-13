@@ -4,8 +4,14 @@
  * Adds the "Expenses" entry to the sidebar panel list and its page to the main
  * panel. The page reads the Host `expenses` projection per Session through the
  * existing session Remote namespace, then shows per-Session token usage and the
- * cost in rubles, priced by the built-in tariff table for the models the
- * sessions actually used.
+ * cost in rubles.
+ *
+ * Prices come from `GET /api-expenses/prices`, the Host-side proxy over Polza's
+ * live catalogue. That catalogue quotes input, output, cache read and cache
+ * write separately, and cache reads are what dominate a long agent session: on
+ * this Host they were 77% of five days of spend. The built-in table below is
+ * only a fallback for an unreachable catalogue, so the page still shows a
+ * number instead of a dash.
  *
  * @module @local/dsh-expenses/client
  */
@@ -20,26 +26,43 @@ window.__ModuleLoader__.load({
     const PROJECTION_KEY = 'expenses'
     const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/
 
+    /** Host route serving Polza's live catalogue (see `index.js`). */
+    const PRICES_PATH = '/api-expenses/prices'
+
     /**
-     * Rubles per 1M tokens, Polza AI list prices.
-     * Sources: https://polza.ai/models/deepseek/deepseek-v4.1-flash-1017 and
-     * https://polza.ai/models/deepseek/deepseek-v4-pro (checked 2026-11-09).
-     * Update the numbers here when the provider changes them.
+     * Fallback tariffs in rubles per 1M tokens, used only when the Host route
+     * cannot reach Polza. Values are copied from `GET /api/v1/models`
+     * (`top_provider.pricing`) on 2026-11-13, cache rates included — a tariff
+     * without its cache rate understates a long session by an order of
+     * magnitude.
      */
-    const TARIFFS = [
+    const FALLBACK_TARIFFS = [
       {
         id: 'deepseek/deepseek-v4.1-flash-1017',
         match: (model) => model.includes('flash'),
         label: 'DeepSeek V4.1 Flash',
-        input: 11.9,
-        output: 17.68,
+        input: 8.65693786,
+        output: 12.8568384,
+        cacheRead: 0.8333136,
+        cacheWrite: 0,
       },
       {
         id: 'deepseek/deepseek-v4-pro',
         match: (model) => model.includes('pro'),
         label: 'DeepSeek V4 Pro',
-        input: 106.08,
-        output: 176.8,
+        input: 107.14032,
+        output: 178.5672,
+        cacheRead: 29.7612,
+        cacheWrite: 0,
+      },
+      {
+        id: 'anthropic/claude-sonnet-5.5',
+        match: (model) => model.includes('sonnet'),
+        label: 'Claude Sonnet 5.5',
+        input: 243.0498,
+        output: 1215.249,
+        cacheRead: 12.15249,
+        cacheWrite: 303.81225,
       },
     ]
 
@@ -51,17 +74,23 @@ window.__ModuleLoader__.load({
         'summary.today': 'Today',
         'summary.all': 'All time',
         'stat.input': 'Input tokens',
+        'stat.cache': 'Cache read tokens',
         'stat.output': 'Output tokens',
         'stat.requests': 'Model requests',
         'stat.tools': 'Tool calls',
         'tariff.title': 'Tariff, ₽ per 1M tokens:',
         'tariff.none': 'no tariff',
         'tariff.missing': 'Cost is incomplete: some models have no tariff.',
+        'tariff.live': 'live Polza catalogue, updated',
+        'tariff.fallback': 'built-in table, Polza API unavailable',
+        'balance.spent': 'Charged by Polza',
+        'balance.available': 'Balance left',
         'action.refresh': 'Refresh',
         'action.reloading': 'Refreshing…',
         'table.session': 'Session',
         'table.date': 'Date',
         'table.input': 'Input',
+        'table.cache': 'Cache',
         'table.output': 'Output',
         'table.requests': 'Requests',
         'table.tools': 'Tool calls',
@@ -81,17 +110,23 @@ window.__ModuleLoader__.load({
         'summary.today': 'Сегодня',
         'summary.all': 'За всё время',
         'stat.input': 'Входные токены',
+        'stat.cache': 'Токены из кэша',
         'stat.output': 'Выходные токены',
         'stat.requests': 'Запросы к модели',
         'stat.tools': 'Вызовы инструментов',
         'tariff.title': 'Тариф, ₽ за 1 млн токенов:',
         'tariff.none': 'тарифа нет',
         'tariff.missing': 'Стоимость неполная: для части моделей нет тарифа.',
+        'tariff.live': 'каталог Polza, обновлено',
+        'tariff.fallback': 'встроенная таблица, API Polza недоступен',
+        'balance.spent': 'Списано на Polza',
+        'balance.available': 'Остаток',
         'action.refresh': 'Обновить',
         'action.reloading': 'Обновление…',
         'table.session': 'Сессия',
         'table.date': 'Дата',
         'table.input': 'Вход',
+        'table.cache': 'Кэш',
         'table.output': 'Выход',
         'table.requests': 'Запросы',
         'table.tools': 'Инструменты',
@@ -221,6 +256,15 @@ window.__ModuleLoader__.load({
       }
       .dsh-expenses-tariff-missing {
         color: var(--dsw-alias-state-warn-primary);
+      }
+      .dsh-expenses-tariff-source {
+        color: var(--dsw-alias-label-caption, var(--dsw-alias-label-secondary));
+      }
+      .dsh-expenses-balance {
+        margin: 8px 0 0;
+        font-size: 12.5px;
+        color: var(--dsw-alias-label-secondary);
+        font-variant-numeric: tabular-nums;
       }
       .dsh-expenses-status {
         display: flex;
@@ -393,37 +437,83 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** The tariff for one model id, or null when the table has no entry. */
-    function tariffFor(modelId) {
+    /**
+     * The tariff for one model id, or null when nothing prices it.
+     * The live catalogue wins. Ids that arrive without a provider prefix
+     * (`deepseek-flash` is written that way in older journals) are matched by
+     * their last path segment.
+     */
+    function tariffFor(modelId, catalog) {
       if (typeof modelId !== 'string' || modelId.length === 0) return null
-      const exact = TARIFFS.find((tariff) => tariff.id === modelId)
-      if (exact) return exact
+      const prices = catalog && catalog.prices
+      if (prices && typeof prices === 'object') {
+        const exact = prices[modelId]
+        if (exact) return { ...exact, label: labelOf(exact, modelId) }
+        for (const id of Object.keys(prices)) {
+          if (id.endsWith(`/${modelId}`)) return { ...prices[id], label: labelOf(prices[id], id) }
+        }
+      }
+      const exactFallback = FALLBACK_TARIFFS.find((tariff) => tariff.id === modelId)
+      if (exactFallback) return exactFallback
       const lower = modelId.toLowerCase()
-      return TARIFFS.find((tariff) => tariff.match(lower)) || null
+      return FALLBACK_TARIFFS.find((tariff) => tariff.match(lower)) || null
+    }
+
+    /** A catalogue entry's own name, or the model id when it has none. */
+    function labelOf(price, modelId) {
+      return price && typeof price.label === 'string' && price.label.length > 0 ? price.label : modelId
     }
 
     function emptyTotals() {
-      return { input: 0, output: 0, requests: 0, toolCalls: 0, cost: 0, priced: false, unpriced: [] }
+      return {
+        input: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        output: 0,
+        requests: 0,
+        toolCalls: 0,
+        cost: 0,
+        priced: false,
+        unpriced: [],
+      }
+    }
+
+    /** Rubles for one model bucket under one tariff. */
+    function bucketCost(bucket, tariff) {
+      return (
+        (bucket.input / 1e6) * tariff.input +
+        (bucket.output / 1e6) * tariff.output +
+        (bucket.cacheRead / 1e6) * (tariff.cacheRead || 0) +
+        (bucket.cacheWrite / 1e6) * (tariff.cacheWrite || 0)
+      )
     }
 
     /** Token totals and cost for one model map. */
-    function summarizeModels(models) {
+    function summarizeModels(models, catalog) {
       const totals = emptyTotals()
       if (!models || typeof models !== 'object') return totals
       for (const id of Object.keys(models)) {
-        const bucket = models[id]
-        if (!bucket || typeof bucket !== 'object') continue
-        const input = numberOrZero(bucket.input)
-        const output = numberOrZero(bucket.output)
-        totals.input += input
-        totals.output += output
-        totals.requests += numberOrZero(bucket.requests)
-        const tariff = tariffFor(id)
+        const raw = models[id]
+        if (!raw || typeof raw !== 'object') continue
+        const bucket = {
+          input: numberOrZero(raw.input),
+          output: numberOrZero(raw.output),
+          cacheRead: numberOrZero(raw.cacheRead),
+          cacheWrite: numberOrZero(raw.cacheWrite),
+        }
+        totals.input += bucket.input
+        totals.cacheRead += bucket.cacheRead
+        totals.cacheWrite += bucket.cacheWrite
+        totals.output += bucket.output
+        totals.requests += numberOrZero(raw.requests)
+        const tariff = tariffFor(id, catalog)
         if (tariff === null) {
-          if ((input > 0 || output > 0) && totals.unpriced.includes(id) === false) totals.unpriced.push(id)
+          if ((bucket.input > 0 || bucket.output > 0 || bucket.cacheRead > 0) && totals.unpriced.includes(id) === false) {
+            totals.unpriced.push(id)
+          }
           continue
         }
-        totals.cost += (input / 1e6) * tariff.input + (output / 1e6) * tariff.output
+        totals.cost += bucketCost(bucket, tariff)
         totals.priced = true
       }
       return totals
@@ -431,6 +521,8 @@ window.__ModuleLoader__.load({
 
     function addTotals(target, source, toolCalls) {
       target.input += source.input
+      target.cacheRead += source.cacheRead
+      target.cacheWrite += source.cacheWrite
       target.output += source.output
       target.requests += source.requests
       target.toolCalls += toolCalls
@@ -441,22 +533,22 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function rowTotals(usage) {
-      const totals = summarizeModels(usage.models)
+    function rowTotals(usage, catalog) {
+      const totals = summarizeModels(usage.models, catalog)
       totals.toolCalls = usage.toolCalls
       return totals
     }
 
-    function computeTotals(rows) {
+    function computeTotals(rows, catalog) {
       const all = emptyTotals()
       const today = emptyTotals()
       const todayKey = localDayKey(Date.now())
       for (const row of rows) {
         const usage = row.usage
         if (!usage) continue
-        addTotals(all, summarizeModels(usage.models), usage.toolCalls)
+        addTotals(all, summarizeModels(usage.models, catalog), usage.toolCalls)
         const day = Object.hasOwn(usage.days, todayKey) ? usage.days[todayKey] : null
-        if (day) addTotals(today, summarizeModels(day.models), day.toolCalls)
+        if (day) addTotals(today, summarizeModels(day.models, catalog), day.toolCalls)
       }
       return { all, today }
     }
@@ -590,6 +682,7 @@ window.__ModuleLoader__.load({
             'dl',
             { className: 'dsh-expenses-metrics' },
             metric(t('stat.input'), formatInteger(totals.input)),
+            metric(t('stat.cache'), formatInteger(totals.cacheRead + totals.cacheWrite)),
             metric(t('stat.output'), formatInteger(totals.output)),
             metric(t('stat.requests'), formatInteger(totals.requests)),
             metric(t('stat.tools'), formatInteger(totals.toolCalls)),
@@ -601,13 +694,17 @@ window.__ModuleLoader__.load({
         return h('th', { key: label, className, scope: 'col' }, label)
       }
 
-      function tariffLine(rows) {
+      function formatClock(time) {
+        if (typeof time !== 'number' || !Number.isFinite(time) || time <= 0) return ''
+        return new Date(time).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+      }
+
+      function tariffLine(rows, catalog, info) {
         const ids = usedModels(rows)
-        if (ids.length === 0) return [h('span', { className: 'dsh-expenses-tariff-title' }, t('tariff.title'))]
         const items = []
         let missing = false
         for (const id of ids) {
-          const tariff = tariffFor(id)
+          const tariff = tariffFor(id, catalog)
           if (tariff === null) {
             missing = true
             items.push(
@@ -619,18 +716,35 @@ window.__ModuleLoader__.load({
             h(
               'span',
               { key: id, className: 'dsh-expenses-tariff-item' },
-              `${tariff.label} — ${t('table.input')} ${formatTariffRate(tariff.input)} · ` +
+              `${labelOf(tariff, id)} — ${t('table.input')} ${formatTariffRate(tariff.input)} · ` +
+                `${t('table.cache')} ${formatTariffRate(tariff.cacheRead || 0)} · ` +
                 `${t('table.output')} ${formatTariffRate(tariff.output)}`,
             ),
           )
         }
+        const live = Boolean(info && info.live)
+        const stamp = live ? formatClock(info.fetchedAt) : ''
+        const source = `${live ? t('tariff.live') : t('tariff.fallback')}${stamp === '' ? '' : ` ${stamp}`}`
         return [
-          h('span', { className: 'dsh-expenses-tariff-title' }, t('tariff.title')),
+          h('span', { key: 'title', className: 'dsh-expenses-tariff-title' }, t('tariff.title')),
           ...items,
           missing
             ? h('span', { key: 'missing', className: 'dsh-expenses-tariff-missing' }, t('tariff.missing'))
             : null,
+          h('span', { key: 'source', className: 'dsh-expenses-tariff-source' }, `· ${source}`),
         ]
+      }
+
+      /** What Polza actually charged, so the page can be checked against billing. */
+      function balanceLine(balance) {
+        if (!balance || typeof balance !== 'object') return null
+        const parts = []
+        if (typeof balance.spent === 'number') parts.push(`${t('balance.spent')} ${formatRub(balance.spent)}`)
+        if (typeof balance.available === 'number') {
+          parts.push(`${t('balance.available')} ${formatRub(balance.available)}`)
+        }
+        if (parts.length === 0) return null
+        return h('div', { className: 'dsh-expenses-balance' }, parts.join(' · '))
       }
 
       return function ExpensesPanel() {
@@ -639,7 +753,32 @@ window.__ModuleLoader__.load({
         const [progress, setProgress] = React.useState({ done: 0, total: 0 })
         const [unreadable, setUnreadable] = React.useState(0)
         const [error, setError] = React.useState(null)
+        const [catalog, setCatalog] = React.useState(null)
+        const [catalogInfo, setCatalogInfo] = React.useState({ live: false, fetchedAt: 0, balance: null })
         const generationRef = React.useRef(0)
+
+        /**
+         * Prices first: a page that renders cost before the catalogue arrives
+         * would flash the fallback tariff, which is exactly the number this
+         * panel exists to correct.
+         */
+        const loadPrices = React.useCallback(async () => {
+          try {
+            const response = await fetch(PRICES_PATH, { headers: { Accept: 'application/json' } })
+            if (!response.ok) throw new Error(`HTTP ${response.status}`)
+            const body = await response.json()
+            if (!body || body.ok !== true || !body.prices) throw new Error('price catalogue unavailable')
+            setCatalog({ prices: body.prices, currency: body.currency })
+            setCatalogInfo({
+              live: true,
+              fetchedAt: typeof body.fetchedAt === 'number' ? body.fetchedAt : 0,
+              balance: body.balance && typeof body.balance === 'object' ? body.balance : null,
+            })
+          } catch {
+            setCatalog(null)
+            setCatalogInfo({ live: false, fetchedAt: 0, balance: null })
+          }
+        }, [])
 
         const load = React.useCallback(async () => {
           const generation = generationRef.current + 1
@@ -723,14 +862,20 @@ window.__ModuleLoader__.load({
         }, [])
 
         React.useEffect(() => {
+          loadPrices()
           load()
           return () => {
             generationRef.current += 1
           }
-        }, [load])
+        }, [load, loadPrices])
 
-        const totals = React.useMemo(() => computeTotals(rows), [rows])
-        const tariffItems = React.useMemo(() => tariffLine(rows), [rows])
+        const refreshAll = React.useCallback(() => {
+          loadPrices()
+          load()
+        }, [load, loadPrices])
+
+        const totals = React.useMemo(() => computeTotals(rows, catalog), [rows, catalog])
+        const tariffItems = React.useMemo(() => tariffLine(rows, catalog, catalogInfo), [rows, catalog, catalogInfo])
         const isLoading = phase === 'loading'
         const showTable = rows.length > 0
 
@@ -755,7 +900,7 @@ window.__ModuleLoader__.load({
                 {
                   type: 'button',
                   className: 'dsh-expenses-button',
-                  onClick: load,
+                  onClick: refreshAll,
                   disabled: isLoading,
                 },
                 isLoading ? t('action.reloading') : t('action.refresh'),
@@ -768,6 +913,7 @@ window.__ModuleLoader__.load({
               summaryCard('all', t('summary.all'), totals.all),
             ),
             h('div', { className: 'dsh-expenses-tariff' }, ...tariffItems),
+            balanceLine(catalogInfo.balance),
             isLoading
               ? h(
                   'div',
@@ -811,6 +957,7 @@ window.__ModuleLoader__.load({
                         headerCell(t('table.session')),
                         headerCell(t('table.date')),
                         headerCell(t('table.input'), 'dsh-expenses-cell-num'),
+                        headerCell(t('table.cache'), 'dsh-expenses-cell-num'),
                         headerCell(t('table.output'), 'dsh-expenses-cell-num'),
                         headerCell(t('table.requests'), 'dsh-expenses-cell-num'),
                         headerCell(t('table.tools'), 'dsh-expenses-cell-num'),
@@ -822,7 +969,7 @@ window.__ModuleLoader__.load({
                       null,
                       rows.map((row) => {
                         const usage = row.usage
-                        const summary = usage ? rowTotals(usage) : null
+                        const summary = usage ? rowTotals(usage, catalog) : null
                         const placeholder = row.failed ? '—' : '…'
                         const title = usage ? usage.title || t('session.untitled') : placeholder
                         return h(
@@ -842,6 +989,11 @@ window.__ModuleLoader__.load({
                             'td',
                             { className: 'dsh-expenses-cell-num' },
                             summary ? formatInteger(summary.input) : placeholder,
+                          ),
+                          h(
+                            'td',
+                            { className: 'dsh-expenses-cell-num' },
+                            summary ? formatInteger(summary.cacheRead + summary.cacheWrite) : placeholder,
                           ),
                           h(
                             'td',
@@ -875,6 +1027,11 @@ window.__ModuleLoader__.load({
                         h('td', { className: 'dsh-expenses-cell-session' }, t('table.total')),
                         h('td', { className: 'dsh-expenses-cell-date' }, ''),
                         h('td', { className: 'dsh-expenses-cell-num' }, formatInteger(totals.all.input)),
+                        h(
+                          'td',
+                          { className: 'dsh-expenses-cell-num' },
+                          formatInteger(totals.all.cacheRead + totals.all.cacheWrite),
+                        ),
                         h('td', { className: 'dsh-expenses-cell-num' }, formatInteger(totals.all.output)),
                         h('td', { className: 'dsh-expenses-cell-num' }, formatInteger(totals.all.requests)),
                         h('td', { className: 'dsh-expenses-cell-num' }, formatInteger(totals.all.toolCalls)),
