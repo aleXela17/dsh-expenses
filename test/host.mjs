@@ -2,7 +2,7 @@
 import { pathToFileURL } from 'node:url'
 
 const target = process.argv[2] ? pathToFileURL(process.argv[2]).href : new URL('../index.js', import.meta.url).href
-const { apply, expensesUnit, PRICES_PATH } = await import(target)
+const { apply, expensesUnit, PRICES_PATH, tokenDelta, todayTokens } = await import(target)
 
 const registrations = []
 const routes = []
@@ -60,6 +60,18 @@ check('tool call counted', state.toolCalls === 1)
 const reparsed = expensesUnit.stateSchema.parse(JSON.parse(JSON.stringify(state)))
 check('schema round-trip', reparsed.models['deepseek/deepseek-v4.1-flash-1017'].cacheWrite === 5)
 
+// Watchdog: the ledger read is optional, but the arithmetic must be exact.
+const bucketOf = (input, cacheRead, requests) => ({ input, output: 0, cacheRead, cacheWrite: 0, requests })
+const delta = tokenDelta({ m: bucketOf(10, 5, 2) }, { m: bucketOf(4, 9, 1) })
+check(
+  'token delta subtracts and floors at zero',
+  delta.m.input === 6 && delta.m.cacheRead === 0 && delta.m.requests === 1,
+  JSON.stringify(delta),
+)
+check('delta ignores models absent from the baseline', tokenDelta({ fresh: bucketOf(7, 0, 1) }, {}).fresh.input === 7)
+const ledgerToday = todayTokens(Date.now())
+check('ledger is readable', ledgerToday !== null, ledgerToday === null ? 'no usage-ledger.json' : ledgerToday.day)
+
 // Drive the route with a real request to polza.ai.
 const result = await new Promise((resolve) => {
   const req = { method: 'GET', url: PRICES_PATH, headers: {} }
@@ -88,6 +100,11 @@ check(
   JSON.stringify(flash),
 )
 check('balance present', typeof body.balance?.spent === 'number', JSON.stringify(body.balance))
+check(
+  'watchdog payload present',
+  body.watch === null || (typeof body.watch === 'object' && typeof body.watch.budget === 'number'),
+  JSON.stringify(body.watch && { budget: body.watch.budget, day: body.watch.day }),
+)
 check('currency is RUB', body.currency === 'RUB', String(body.currency))
 
 if (flash) {

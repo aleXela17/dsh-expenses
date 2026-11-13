@@ -85,6 +85,11 @@ window.__ModuleLoader__.load({
         'tariff.fallback': 'built-in table, Polza API unavailable',
         'balance.spent': 'Charged by Polza',
         'balance.available': 'Balance left',
+        'watch.budget': 'Budget',
+        'watch.today': 'spent today',
+        'watch.hour': 'last hour',
+        'watch.projected': 'day projection',
+        'watch.over': 'over budget',
         'action.refresh': 'Refresh',
         'action.reloading': 'Refreshing…',
         'table.session': 'Session',
@@ -121,6 +126,11 @@ window.__ModuleLoader__.load({
         'tariff.fallback': 'встроенная таблица, API Polza недоступен',
         'balance.spent': 'Списано на Polza',
         'balance.available': 'Остаток',
+        'watch.budget': 'Бюджет',
+        'watch.today': 'за сегодня',
+        'watch.hour': 'за час',
+        'watch.projected': 'прогноз за день',
+        'watch.over': 'перебор бюджета',
         'action.refresh': 'Обновить',
         'action.reloading': 'Обновление…',
         'table.session': 'Сессия',
@@ -265,6 +275,16 @@ window.__ModuleLoader__.load({
         font-size: 12.5px;
         color: var(--dsw-alias-label-secondary);
         font-variant-numeric: tabular-nums;
+      }
+      .dsh-expenses-watch {
+        margin: 6px 0 0;
+        font-size: 12.5px;
+        color: var(--dsw-alias-label-secondary);
+        font-variant-numeric: tabular-nums;
+      }
+      .dsh-expenses-watch-over {
+        color: var(--dsw-alias-state-warn-primary);
+        font-weight: 600;
       }
       .dsh-expenses-status {
         display: flex;
@@ -747,6 +767,54 @@ window.__ModuleLoader__.load({
         return h('div', { className: 'dsh-expenses-balance' }, parts.join(' · '))
       }
 
+      /**
+       * Today, the rolling hour and the projected day, in rubles. The Host sends
+       * tokens only; prices stay here, so the watchdog line and the table agree
+       * on every model's tariff.
+       */
+      function watchCosts(watch, catalog) {
+        if (!watch || typeof watch !== 'object') return null
+        const today = summarizeModels(watch.tokensToday, catalog)
+        if (today.priced === false) return null
+        const hour = watch.tokensLastHour ? summarizeModels(watch.tokensLastHour, catalog) : null
+        const sampledAt = typeof watch.sampledAt === 'number' ? watch.sampledAt : Date.now()
+        const stamp = new Date(sampledAt)
+        const elapsed = Number.isNaN(stamp.getTime())
+          ? 1
+          : (stamp.getHours() * 60 + stamp.getMinutes()) / 1440
+        const hoursLeft = Math.max(0, 24 * (1 - elapsed))
+        const perHour = hour !== null && hour.priced ? hour.cost : null
+        const projected = perHour === null ? null : today.cost + perHour * hoursLeft
+        const budget = typeof watch.budget === 'number' && watch.budget > 0 ? watch.budget : null
+        if (budget === null) return null
+        return {
+          budget,
+          day: typeof watch.day === 'string' ? watch.day : '',
+          today: today.cost,
+          perHour,
+          projected,
+          over: (projected === null ? today.cost : projected) > budget,
+        }
+      }
+
+      /** The budget line, marked when today is on track to break the ceiling. */
+      function watchLine(watch, catalog) {
+        const costs = watchCosts(watch, catalog)
+        if (costs === null) return null
+        const parts = [
+          `${t('watch.budget')} ${formatRub(costs.budget)}`,
+          `${t('watch.today')} ${formatRub(costs.today)}`,
+        ]
+        if (costs.perHour !== null) parts.push(`${t('watch.hour')} ${formatRub(costs.perHour)}`)
+        if (costs.projected !== null) parts.push(`${t('watch.projected')} ${formatRub(costs.projected)}`)
+        if (costs.over) parts.push(t('watch.over'))
+        return h(
+          'div',
+          { className: `dsh-expenses-watch${costs.over ? ' dsh-expenses-watch-over' : ''}` },
+          parts.join(' · '),
+        )
+      }
+
       return function ExpensesPanel() {
         const [phase, setPhase] = React.useState('loading')
         const [rows, setRows] = React.useState([])
@@ -754,7 +822,7 @@ window.__ModuleLoader__.load({
         const [unreadable, setUnreadable] = React.useState(0)
         const [error, setError] = React.useState(null)
         const [catalog, setCatalog] = React.useState(null)
-        const [catalogInfo, setCatalogInfo] = React.useState({ live: false, fetchedAt: 0, balance: null })
+        const [catalogInfo, setCatalogInfo] = React.useState({ live: false, fetchedAt: 0, balance: null, watch: null })
         const generationRef = React.useRef(0)
 
         /**
@@ -773,10 +841,11 @@ window.__ModuleLoader__.load({
               live: true,
               fetchedAt: typeof body.fetchedAt === 'number' ? body.fetchedAt : 0,
               balance: body.balance && typeof body.balance === 'object' ? body.balance : null,
+              watch: body.watch && typeof body.watch === 'object' ? body.watch : null,
             })
           } catch {
             setCatalog(null)
-            setCatalogInfo({ live: false, fetchedAt: 0, balance: null })
+            setCatalogInfo({ live: false, fetchedAt: 0, balance: null, watch: null })
           }
         }, [])
 
@@ -914,6 +983,7 @@ window.__ModuleLoader__.load({
             ),
             h('div', { className: 'dsh-expenses-tariff' }, ...tariffItems),
             balanceLine(catalogInfo.balance),
+            watchLine(catalogInfo.watch, catalog),
             isLoading
               ? h(
                   'div',

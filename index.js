@@ -59,6 +59,90 @@ const API_KEY_REF = 'POLZA_AI_API_KEY'
 /** How long a fetched catalogue stays fresh, in milliseconds. */
 const CATALOG_TTL_MS = 30 * 60 * 1000
 
+/**
+ * Watchdog: a daily spend ceiling, plus the rolling-hour rate that projects the
+ * day. The ledger `dsh-api-dashboard` maintains is the only source of a global
+ * token total the Host can read without walking every Session, so the sampler
+ * takes a snapshot of today's rows every couple of minutes and diffs an hour
+ * back. Nothing here calls a model: the page prices the deltas itself.
+ */
+const BUDGET_ENV = 'DSH_EXPENSES_DAILY_BUDGET'
+
+/** Ceiling used when the environment does not name one, in rubles. */
+const DEFAULT_BUDGET_RUB = 150
+
+/** How often the sampler reads the ledger. */
+const WATCH_SAMPLE_MS = 2 * 60 * 1000
+
+/** The rolling window the rate is measured over. */
+const WATCH_HOUR_MS = 60 * 60 * 1000
+
+/** Snapshots older than this are dropped; one day plus an hour of slack. */
+const WATCH_HISTORY_MS = 25 * 60 * 60 * 1000
+
+/** The configured daily ceiling in rubles. */
+function dailyBudget() {
+  const raw = process.env[BUDGET_ENV]
+  const value = typeof raw === 'string' && raw.trim().length > 0 ? Number(raw) : Number.NaN
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_BUDGET_RUB
+}
+
+/** One empty token bucket in the ledger's own vocabulary. */
+function tokenBucket() {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, requests: 0 }
+}
+
+/**
+ * Today's token rows per model, summed over providers, or null when the ledger
+ * has not been written yet. The ledger lives in the same `~/.dsh` as this Host.
+ */
+export function todayTokens(time) {
+  let raw
+  try {
+    raw = JSON.parse(readFileSync(join(dshHome(), 'dsh-usage', 'usage-ledger.json'), 'utf8'))
+  } catch {
+    return null
+  }
+  const day = dayKey(time)
+  const providers = raw?.days?.[day]
+  if (providers === null || typeof providers !== 'object') return { day, models: {} }
+  const models = {}
+  for (const provider of Object.keys(providers)) {
+    const rows = providers[provider]
+    if (rows === null || typeof rows !== 'object') continue
+    for (const model of Object.keys(rows)) {
+      if (model.length === 0) continue
+      const row = rows[model]
+      const bucket = Object.hasOwn(models, model) ? models[model] : tokenBucket()
+      models[model] = {
+        input: bucket.input + count(row?.inputTokens),
+        output: bucket.output + count(row?.outputTokens),
+        cacheRead: bucket.cacheRead + count(row?.cacheReadTokens),
+        cacheWrite: bucket.cacheWrite + count(row?.cacheWriteTokens),
+        requests: bucket.requests + count(row?.calls),
+      }
+    }
+  }
+  return { day, models }
+}
+
+/** `current - baseline` per model, floored at zero. */
+export function tokenDelta(current, baseline) {
+  const delta = {}
+  for (const model of Object.keys(current)) {
+    const now = current[model]
+    const before = Object.hasOwn(baseline, model) ? baseline[model] : tokenBucket()
+    delta[model] = {
+      input: Math.max(0, now.input - before.input),
+      output: Math.max(0, now.output - before.output),
+      cacheRead: Math.max(0, now.cacheRead - before.cacheRead),
+      cacheWrite: Math.max(0, now.cacheWrite - before.cacheWrite),
+      requests: Math.max(0, now.requests - before.requests),
+    }
+  }
+  return delta
+}
+
 /** One local calendar day. */
 function dayKey(time) {
   const date = new Date(time)
@@ -375,6 +459,44 @@ export async function apply(ctx) {
     return cache.inflight
   }
 
+  /**
+   * Watchdog snapshots: the sampler keeps a day of today's totals so an
+   * hour-old baseline is always at hand, and a midnight rollover simply drops
+   * the baseline instead of comparing two different days.
+   */
+  const samples = []
+
+  function watchSnapshot(now = Date.now()) {
+    const current = todayTokens(now)
+    if (current === null) return null
+    samples.push({ t: now, day: current.day, models: current.models })
+    while (samples.length > 0 && now - samples[0].t > WATCH_HISTORY_MS) samples.shift()
+    let baseline = null
+    for (const sample of samples) {
+      if (sample.t <= now - WATCH_HOUR_MS) baseline = sample
+    }
+    const comparable = baseline !== null && baseline.day === current.day
+    return {
+      budget: dailyBudget(),
+      day: current.day,
+      tokensToday: current.models,
+      tokensLastHour: comparable ? tokenDelta(current.models, baseline.models) : null,
+      sampledAt: now,
+    }
+  }
+
+  ctx.effect(() => {
+    const timer = setInterval(() => {
+      try {
+        watchSnapshot()
+      } catch {
+        /* a watchdog must never take the plugin down with it */
+      }
+    }, WATCH_SAMPLE_MS)
+    timer.unref?.()
+    return () => clearInterval(timer)
+  }, 'dsh-expenses: spend watchdog')
+
   ctx.inject(['webServer'], (webCtx) => {
     // The connection gate keeps this route behind the same cookie and origin
     // check as the Host's own pages; a browser on another origin must not be
@@ -451,6 +573,7 @@ export async function apply(ctx) {
               ...cache.data,
               fetchedAt: cache.fetchedAt,
               stale: Date.now() - cache.fetchedAt > CATALOG_TTL_MS,
+              watch: watchSnapshot(),
             })
           },
         }),
